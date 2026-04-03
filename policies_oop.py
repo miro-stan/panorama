@@ -402,23 +402,21 @@ class PanoramaClient:
         return self._parse_nat_rules(root)
 
     # ── Full Device Group Extraction ─────────────────────────────────────────
-
     def fetch_device_group(self, dg_name: str, parent: Optional[str], device_info: dict) -> DeviceGroupData:
         dg = DeviceGroupData(name=dg_name, parent=parent)
 
-        # device_info is fetched once before the loop and passed in to avoid
-        # an extra API round-trip for every device group
         steps = [
-            ("devices",             lambda: self.get_devices_in_group(dg_name, device_info), "devices"),
-            ("address objects",     lambda: self.get_address_objects(dg_name),               "address_objects"),
-            ("address groups",      lambda: self.get_address_groups(dg_name),                "address_groups"),
-            ("service objects",     lambda: self.get_service_objects(dg_name),               "service_objects"),
-            ("service groups",      lambda: self.get_service_groups(dg_name),                "service_groups"),
-            ("tags",                lambda: self.get_tags(dg_name),                          "tags"),
-            ("pre-security rules",  lambda: self.get_security_rules(dg_name, "pre"),         "pre_security_rules"),
-            ("post-security rules", lambda: self.get_security_rules(dg_name, "post"),        "post_security_rules"),
-            ("pre-NAT rules",       lambda: self.get_nat_rules(dg_name, "pre"),              "pre_nat_rules"),
-            ("post-NAT rules",      lambda: self.get_nat_rules(dg_name, "post"),             "post_nat_rules"),
+            # ✅ n=dg_name captures the value NOW, not when the lambda is called later
+            ("devices",             lambda n=dg_name: self.get_devices_in_group(n, device_info), "devices"),
+            ("address objects",     lambda n=dg_name: self.get_address_objects(n),               "address_objects"),
+            ("address groups",      lambda n=dg_name: self.get_address_groups(n),                "address_groups"),
+            ("service objects",     lambda n=dg_name: self.get_service_objects(n),               "service_objects"),
+            ("service groups",      lambda n=dg_name: self.get_service_groups(n),                "service_groups"),
+            ("tags",                lambda n=dg_name: self.get_tags(n),                          "tags"),
+            ("pre-security rules",  lambda n=dg_name: self.get_security_rules(n, "pre"),         "pre_security_rules"),
+            ("post-security rules", lambda n=dg_name: self.get_security_rules(n, "post"),        "post_security_rules"),
+            ("pre-NAT rules",       lambda n=dg_name: self.get_nat_rules(n, "pre"),              "pre_nat_rules"),
+            ("post-NAT rules",      lambda n=dg_name: self.get_nat_rules(n, "post"),             "post_nat_rules"),
         ]
         for label, fn, attr in steps:
             try:
@@ -426,6 +424,29 @@ class PanoramaClient:
             except Exception as ex:
                 print(f"    ⚠️  Could not fetch {label}: {ex}")
         return dg
+    # def fetch_device_group(self, dg_name: str, parent: Optional[str], device_info: dict) -> DeviceGroupData:
+    #     dg = DeviceGroupData(name=dg_name, parent=parent)
+    #
+    #     # device_info is fetched once before the loop and passed in to avoid
+    #     # an extra API round-trip for every device group
+    #     steps = [
+    #         ("devices",             lambda: self.get_devices_in_group(dg_name, device_info), "devices"),
+    #         ("address objects",     lambda: self.get_address_objects(dg_name),               "address_objects"),
+    #         ("address groups",      lambda: self.get_address_groups(dg_name),                "address_groups"),
+    #         ("service objects",     lambda: self.get_service_objects(dg_name),               "service_objects"),
+    #         ("service groups",      lambda: self.get_service_groups(dg_name),                "service_groups"),
+    #         ("tags",                lambda: self.get_tags(dg_name),                          "tags"),
+    #         ("pre-security rules",  lambda: self.get_security_rules(dg_name, "pre"),         "pre_security_rules"),
+    #         ("post-security rules", lambda: self.get_security_rules(dg_name, "post"),        "post_security_rules"),
+    #         ("pre-NAT rules",       lambda: self.get_nat_rules(dg_name, "pre"),              "pre_nat_rules"),
+    #         ("post-NAT rules",      lambda: self.get_nat_rules(dg_name, "post"),             "post_nat_rules"),
+    #     ]
+    #     for label, fn, attr in steps:
+    #         try:
+    #             setattr(dg, attr, fn())
+    #         except Exception as ex:
+    #             print(f"    ⚠️  Could not fetch {label}: {ex}")
+    #     return dg
 
     def fetch_all_device_groups(self) -> list[DeviceGroupData]:
         names       = self.get_device_group_names()
