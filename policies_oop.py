@@ -431,3 +431,4 @@ if __name__ == "__main__":
 
     print_summary(device_groups)
     export_to_json(device_groups, OUTPUT_FILE)
+
