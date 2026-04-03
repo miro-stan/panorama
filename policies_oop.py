@@ -2,6 +2,7 @@ import requests
 import xml.etree.ElementTree as ET
 import urllib3
 import json
+import copy
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
@@ -14,8 +15,8 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 class Device:
     serial: str
     vsys: list[str] = field(default_factory=list)
-    name: str = ""        # Firewall hostname
-    mgmt_ip: str = ""     # Management IP address
+    name: str = ""
+    mgmt_ip: str = ""
 
 @dataclass
 class AddressObject:
@@ -70,8 +71,8 @@ class SecurityRule:
     action: str = ""
     profile_setting: dict = field(default_factory=dict)
     log_setting: str = ""
-    log_start: bool = False   # "Log at Session Start" checkbox
-    log_end: bool = True      # "Log at Session End" checkbox (PAN-OS default is on)
+    log_start: bool = False
+    log_end: bool = True
     disabled: bool = False
 
 @dataclass
@@ -110,16 +111,25 @@ class DeviceGroupData:
 class PanoramaClient:
     BASE_XPATH = "/config/devices/entry[@name='localhost.localdomain']"
 
+    # Fix 1: no-cache headers added to every request to prevent requests-level
+    # response caching when two device groups return identical rulebases
+    NO_CACHE_HEADERS = {"Cache-Control": "no-cache", "Pragma": "no-cache"}
+
     def __init__(self, hostname: str, api_key: str, verify_ssl: bool = False):
-        self.hostname = hostname
-        self.api_key = api_key
+        self.hostname   = hostname
+        self.api_key    = api_key
         self.verify_ssl = verify_ssl
-        self.base_url = f"https://{hostname}/api/"
+        self.base_url   = f"https://{hostname}/api/"
 
     @classmethod
     def from_credentials(cls, hostname: str, username: str, password: str, verify_ssl: bool = False) -> "PanoramaClient":
-        url = f"https://{hostname}/api/"
-        resp = requests.get(url, params={"type": "keygen", "user": username, "password": password}, verify=verify_ssl)
+        url  = f"https://{hostname}/api/"
+        resp = requests.get(
+            url,
+            params={"type": "keygen", "user": username, "password": password},
+            verify=verify_ssl,
+            headers=cls.NO_CACHE_HEADERS,
+        )
         resp.raise_for_status()
         root = ET.fromstring(resp.text)
         if root.attrib.get("status") != "success":
@@ -129,14 +139,21 @@ class PanoramaClient:
         return cls(hostname, api_key, verify_ssl)
 
     def _query(self, xpath: str) -> ET.Element:
-        """Execute a config GET query and return the root XML element."""
+        """
+        Execute a config GET query and return the root XML element.
+        Fix 1: Cache-Control headers prevent HTTP-level response caching.
+        """
         resp = requests.get(
             self.base_url,
             params={"type": "config", "action": "get", "xpath": xpath, "key": self.api_key},
             verify=self.verify_ssl,
+            headers=self.NO_CACHE_HEADERS,
         )
         resp.raise_for_status()
-        root = ET.fromstring(resp.text)
+        # Fix 3: deep-copy the parsed tree so each call gets fully independent
+        # Element objects — prevents shared references across device groups
+        # when Panorama returns structurally identical XML for inherited policies
+        root = copy.deepcopy(ET.fromstring(resp.text))
         if root.attrib.get("status") != "success":
             raise Exception(f"Query failed for xpath [{xpath}]: {resp.text}")
         return root
@@ -147,9 +164,10 @@ class PanoramaClient:
             self.base_url,
             params={"type": "op", "cmd": cmd, "key": self.api_key},
             verify=self.verify_ssl,
+            headers=self.NO_CACHE_HEADERS,
         )
         resp.raise_for_status()
-        root = ET.fromstring(resp.text)
+        root = copy.deepcopy(ET.fromstring(resp.text))
         if root.attrib.get("status") != "success":
             raise Exception(f"Op command failed [{cmd}]: {resp.text}")
         return root
@@ -187,14 +205,12 @@ class PanoramaClient:
             for e in root.findall(".//device-group/entry")
         }
 
-    # ── Devices (with hostname + management IP) ──────────────────────────────
+    # ── Devices ──────────────────────────────────────────────────────────────
 
     def _get_connected_device_info(self) -> dict[str, dict]:
         """
-        Fetch the name and management IP for every device Panorama knows about.
-        Uses the 'show devices all' op command which returns a flat list of all
-        connected and disconnected firewalls with their serial, hostname, and IP.
-        Returns a dict keyed by serial number: {"name": ..., "mgmt_ip": ...}
+        Fetch hostname and management IP for every device Panorama knows about.
+        Returns a dict keyed by serial: {"name": ..., "mgmt_ip": ...}
         """
         device_info = {}
         try:
@@ -210,11 +226,7 @@ class PanoramaClient:
         return device_info
 
     def get_devices_in_group(self, dg_name: str, device_info: dict) -> list[Device]:
-        """
-        Return firewalls assigned to a device group, enriched with hostname
-        and management IP looked up from the pre-fetched device_info dict.
-        """
-        root = self._query(self._dg_xpath(dg_name, "/devices"))
+        root    = self._query(self._dg_xpath(dg_name, "/devices"))
         devices = []
         for entry in root.findall(".//devices/entry"):
             serial = entry.attrib["name"]
@@ -231,7 +243,7 @@ class PanoramaClient:
     # ── Object Parsers ───────────────────────────────────────────────────────
 
     def get_address_objects(self, dg_name: str) -> list[AddressObject]:
-        root = self._query(self._dg_xpath(dg_name, "/address"))
+        root    = self._query(self._dg_xpath(dg_name, "/address"))
         objects = []
         for e in root.findall(".//address/entry"):
             addr_type, value = "unknown", ""
@@ -250,7 +262,7 @@ class PanoramaClient:
         return objects
 
     def get_address_groups(self, dg_name: str) -> list[AddressGroup]:
-        root = self._query(self._dg_xpath(dg_name, "/address-group"))
+        root   = self._query(self._dg_xpath(dg_name, "/address-group"))
         groups = []
         for e in root.findall(".//address-group/entry"):
             static_node  = e.find("static")
@@ -266,7 +278,7 @@ class PanoramaClient:
         return groups
 
     def get_service_objects(self, dg_name: str) -> list[ServiceObject]:
-        root = self._query(self._dg_xpath(dg_name, "/service"))
+        root     = self._query(self._dg_xpath(dg_name, "/service"))
         services = []
         for e in root.findall(".//service/entry"):
             proto, src_port, dst_port = "unknown", "", ""
@@ -314,6 +326,10 @@ class PanoramaClient:
     def _parse_security_rules(self, root: ET.Element) -> list[SecurityRule]:
         rules = []
         for e in root.findall(".//rules/entry"):
+            # Fix 3: deep-copy each rule element so rules with identical names
+            # across device groups are fully independent objects in memory
+            e = copy.deepcopy(e)
+
             profile_setting = {}
             ps = e.find("profile-setting")
             if ps is not None:
@@ -329,9 +345,7 @@ class PanoramaClient:
                         "spyware": self._text(ps, "profiles/spyware/member"),
                     }
 
-            # log-start defaults to 'no' in PAN-OS when the tag is absent.
-            # log-end defaults to 'yes' in PAN-OS when the tag is absent.
-            log_start = self._text(e, "log-start", default="no") == "yes"
+            log_start = self._text(e, "log-start", default="no")  == "yes"
             log_end   = self._text(e, "log-end",   default="yes") == "yes"
 
             rules.append(SecurityRule(
@@ -357,6 +371,9 @@ class PanoramaClient:
     def _parse_nat_rules(self, root: ET.Element) -> list[NatRule]:
         rules = []
         for e in root.findall(".//rules/entry"):
+            # Fix 3: same deep-copy protection applied to NAT rules
+            e = copy.deepcopy(e)
+
             src_xlat, dst_xlat = {}, {}
             src_node = e.find("source-translation")
             if src_node is not None:
@@ -378,18 +395,18 @@ class PanoramaClient:
                     "translated-port":    self._text(dst_node, "translated-port"),
                 }
             rules.append(NatRule(
-                name                     = e.attrib["name"],
-                description              = self._text(e, "description"),
-                tags                     = self._tags(e),
-                source_zones             = self._members(e.find("from")),
-                destination_zones        = self._members(e.find("to")),
-                source_addresses         = self._members(e.find("source")),
-                destination_addresses    = self._members(e.find("destination")),
-                services                 = self._members(e.find("service")) or [self._text(e, "service")],
-                nat_type                 = self._text(e, "nat-type", "ipv4"),
-                source_translation       = src_xlat,
-                destination_translation  = dst_xlat,
-                disabled                 = self._text(e, "disabled") == "yes",
+                name                    = e.attrib["name"],
+                description             = self._text(e, "description"),
+                tags                    = self._tags(e),
+                source_zones            = self._members(e.find("from")),
+                destination_zones       = self._members(e.find("to")),
+                source_addresses        = self._members(e.find("source")),
+                destination_addresses   = self._members(e.find("destination")),
+                services                = self._members(e.find("service")) or [self._text(e, "service")],
+                nat_type                = self._text(e, "nat-type", "ipv4"),
+                source_translation      = src_xlat,
+                destination_translation = dst_xlat,
+                disabled                = self._text(e, "disabled") == "yes",
             ))
         return rules
 
@@ -402,11 +419,11 @@ class PanoramaClient:
         return self._parse_nat_rules(root)
 
     # ── Full Device Group Extraction ─────────────────────────────────────────
+
     def fetch_device_group(self, dg_name: str, parent: Optional[str], device_info: dict) -> DeviceGroupData:
         dg = DeviceGroupData(name=dg_name, parent=parent)
 
         steps = [
-            # ✅ n=dg_name captures the value NOW, not when the lambda is called later
             ("devices",             lambda n=dg_name: self.get_devices_in_group(n, device_info), "devices"),
             ("address objects",     lambda n=dg_name: self.get_address_objects(n),               "address_objects"),
             ("address groups",      lambda n=dg_name: self.get_address_groups(n),                "address_groups"),
@@ -424,34 +441,11 @@ class PanoramaClient:
             except Exception as ex:
                 print(f"    ⚠️  Could not fetch {label}: {ex}")
         return dg
-    # def fetch_device_group(self, dg_name: str, parent: Optional[str], device_info: dict) -> DeviceGroupData:
-    #     dg = DeviceGroupData(name=dg_name, parent=parent)
-    #
-    #     # device_info is fetched once before the loop and passed in to avoid
-    #     # an extra API round-trip for every device group
-    #     steps = [
-    #         ("devices",             lambda: self.get_devices_in_group(dg_name, device_info), "devices"),
-    #         ("address objects",     lambda: self.get_address_objects(dg_name),               "address_objects"),
-    #         ("address groups",      lambda: self.get_address_groups(dg_name),                "address_groups"),
-    #         ("service objects",     lambda: self.get_service_objects(dg_name),               "service_objects"),
-    #         ("service groups",      lambda: self.get_service_groups(dg_name),                "service_groups"),
-    #         ("tags",                lambda: self.get_tags(dg_name),                          "tags"),
-    #         ("pre-security rules",  lambda: self.get_security_rules(dg_name, "pre"),         "pre_security_rules"),
-    #         ("post-security rules", lambda: self.get_security_rules(dg_name, "post"),        "post_security_rules"),
-    #         ("pre-NAT rules",       lambda: self.get_nat_rules(dg_name, "pre"),              "pre_nat_rules"),
-    #         ("post-NAT rules",      lambda: self.get_nat_rules(dg_name, "post"),             "post_nat_rules"),
-    #     ]
-    #     for label, fn, attr in steps:
-    #         try:
-    #             setattr(dg, attr, fn())
-    #         except Exception as ex:
-    #             print(f"    ⚠️  Could not fetch {label}: {ex}")
-    #     return dg
 
     def fetch_all_device_groups(self) -> list[DeviceGroupData]:
         names       = self.get_device_group_names()
         hierarchy   = self.get_device_group_hierarchy()
-        device_info = self._get_connected_device_info()   # one call, shared across all groups
+        device_info = self._get_connected_device_info()
 
         print(f"\nFound {len(names)} device group(s). Starting extraction...\n")
         result = []
@@ -498,8 +492,10 @@ def print_summary(device_groups: list[DeviceGroupData]) -> None:
 
 
 def export_to_json(device_groups: list[DeviceGroupData], output_file: str = "panorama_full_export.json") -> None:
+    # Fix 2: deep-copy before asdict() prevents dataclasses.asdict() from
+    # memoizing and deduplicating shared object references across device groups
     with open(output_file, "w") as f:
-        json.dump([asdict(dg) for dg in device_groups], f, indent=2)
+        json.dump([asdict(copy.deepcopy(dg)) for dg in device_groups], f, indent=2)
     print(f"\n✅ Full export saved to: {output_file}")
 
 
@@ -518,4 +514,3 @@ if __name__ == "__main__":
 
     print_summary(device_groups)
     export_to_json(device_groups, OUTPUT_FILE)
-    
