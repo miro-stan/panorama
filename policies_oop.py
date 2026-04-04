@@ -4,7 +4,7 @@ import urllib3
 import json
 import copy
 from dataclasses import dataclass, field, asdict
-from typing import Optional
+from typing import Optional, Union
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -59,6 +59,8 @@ class Tag:
 @dataclass
 class SecurityRule:
     name: str
+    rule_name: str
+    device_group: str
     rule_type: str = "universal"
     description: str = ""
     tags: list[str] = field(default_factory=list)
@@ -78,6 +80,8 @@ class SecurityRule:
 @dataclass
 class NatRule:
     name: str
+    rule_name: str
+    device_group: str
     description: str = ""
     tags: list[str] = field(default_factory=list)
     source_zones: list[str] = field(default_factory=list)
@@ -86,8 +90,8 @@ class NatRule:
     destination_addresses: list[str] = field(default_factory=list)
     services: list[str] = field(default_factory=list)
     nat_type: str = "ipv4"
-    source_translation: dict = field(default_factory=dict)
-    destination_translation: dict = field(default_factory=dict)
+    source_translation: dict[str, Union[str, list[str]]] = field(default_factory=dict)
+    destination_translation: dict[str, str] = field(default_factory=dict)
     disabled: bool = False
 
 @dataclass
@@ -109,10 +113,7 @@ class DeviceGroupData:
 # ── Panorama API Client ──────────────────────────────────────────────────────
 
 class PanoramaClient:
-    BASE_XPATH = "/config/devices/entry[@name='localhost.localdomain']"
-
-    # Fix 1: no-cache headers added to every request to prevent requests-level
-    # response caching when two device groups return identical rulebases
+    BASE_XPATH    = "/config/devices/entry[@name='localhost.localdomain']"
     NO_CACHE_HEADERS = {"Cache-Control": "no-cache", "Pragma": "no-cache"}
 
     def __init__(self, hostname: str, api_key: str, verify_ssl: bool = False):
@@ -126,33 +127,33 @@ class PanoramaClient:
         url  = f"https://{hostname}/api/"
         resp = requests.get(
             url,
-            params={"type": "keygen", "user": username, "password": password},
-            verify=verify_ssl,
+            params ={"type": "keygen", "user": username, "password": password},
+            verify =verify_ssl,
             headers=cls.NO_CACHE_HEADERS,
         )
         resp.raise_for_status()
         root = ET.fromstring(resp.text)
         if root.attrib.get("status") != "success":
             raise Exception("Authentication failed. Check your credentials.")
-        api_key = root.find(".//key").text
+
+        # Fix error 1 & 2: find().text is str | None — validate before use
+        key_node = root.find(".//key")
+        if key_node is None or key_node.text is None:
+            raise Exception("API key not found in Panorama response.")
+        api_key: str = key_node.text
+
         print("✅ Authentication successful.")
         return cls(hostname, api_key, verify_ssl)
 
     def _query(self, xpath: str) -> ET.Element:
-        """
-        Execute a config GET query and return the root XML element.
-        Fix 1: Cache-Control headers prevent HTTP-level response caching.
-        """
+        """Execute a config GET query and return the root XML element."""
         resp = requests.get(
             self.base_url,
-            params={"type": "config", "action": "get", "xpath": xpath, "key": self.api_key},
-            verify=self.verify_ssl,
-            headers=self.NO_CACHE_HEADERS,
+            params  ={"type": "config", "action": "get", "xpath": xpath, "key": self.api_key},
+            verify  =self.verify_ssl,
+            headers =self.NO_CACHE_HEADERS,
         )
         resp.raise_for_status()
-        # Fix 3: deep-copy the parsed tree so each call gets fully independent
-        # Element objects — prevents shared references across device groups
-        # when Panorama returns structurally identical XML for inherited policies
         root = copy.deepcopy(ET.fromstring(resp.text))
         if root.attrib.get("status") != "success":
             raise Exception(f"Query failed for xpath [{xpath}]: {resp.text}")
@@ -162,9 +163,9 @@ class PanoramaClient:
         """Execute an operational (op) command and return the root XML element."""
         resp = requests.get(
             self.base_url,
-            params={"type": "op", "cmd": cmd, "key": self.api_key},
-            verify=self.verify_ssl,
-            headers=self.NO_CACHE_HEADERS,
+            params  ={"type": "op", "cmd": cmd, "key": self.api_key},
+            verify  =self.verify_ssl,
+            headers =self.NO_CACHE_HEADERS,
         )
         resp.raise_for_status()
         root = copy.deepcopy(ET.fromstring(resp.text))
@@ -200,19 +201,29 @@ class PanoramaClient:
 
     def get_device_group_hierarchy(self) -> dict[str, Optional[str]]:
         root = self._query(f"/config/readonly{self.BASE_XPATH}/device-group")
-        return {
-            e.attrib["name"]: (e.find("parent-dg").text if e.find("parent-dg") is not None else None)
-            for e in root.findall(".//device-group/entry")
-        }
+        result = {}
+        for e in root.findall(".//device-group/entry"):
+            parent_node = e.find("parent-dg")
+            result[e.attrib["name"]] = parent_node.text if parent_node is not None else None
+        return result
+
+
+
+    # def get_device_group_hierarchy(self) -> dict[str, Optional[str]]:
+    #     root = self._query(f"/config/readonly{self.BASE_XPATH}/device-group")
+    #     return {
+    #         e.attrib["name"]: (e.find("parent-dg").text if e.find("parent-dg") is not None else None)
+    #         for e in root.findall(".//device-group/entry")
+    #     }
 
     # ── Devices ──────────────────────────────────────────────────────────────
 
-    def _get_connected_device_info(self) -> dict[str, dict]:
+    def _get_connected_device_info(self) -> dict[str, dict[str, str]]:
         """
         Fetch hostname and management IP for every device Panorama knows about.
         Returns a dict keyed by serial: {"name": ..., "mgmt_ip": ...}
         """
-        device_info = {}
+        device_info: dict[str, dict[str, str]] = {}
         try:
             root = self._op("<show><devices><all></all></devices></show>")
             for entry in root.findall(".//devices/entry"):
@@ -225,7 +236,7 @@ class PanoramaClient:
             print(f"    ⚠️  Could not fetch device info (name/IP): {ex}")
         return device_info
 
-    def get_devices_in_group(self, dg_name: str, device_info: dict) -> list[Device]:
+    def get_devices_in_group(self, dg_name: str, device_info: dict[str, dict[str, str]]) -> list[Device]:
         root    = self._query(self._dg_xpath(dg_name, "/devices"))
         devices = []
         for entry in root.findall(".//devices/entry"):
@@ -246,11 +257,14 @@ class PanoramaClient:
         root    = self._query(self._dg_xpath(dg_name, "/address"))
         objects = []
         for e in root.findall(".//address/entry"):
-            addr_type, value = "unknown", ""
+            e         = copy.deepcopy(e)
+            addr_type = "unknown"
+            value     = ""
             for t in ("ip-netmask", "ip-range", "fqdn", "ip-wildcard"):
                 node = e.find(t)
                 if node is not None:
-                    addr_type, value = t, node.text or ""
+                    addr_type = t
+                    value     = node.text or ""
                     break
             objects.append(AddressObject(
                 name        = e.attrib["name"],
@@ -265,13 +279,18 @@ class PanoramaClient:
         root   = self._query(self._dg_xpath(dg_name, "/address-group"))
         groups = []
         for e in root.findall(".//address-group/entry"):
+            e            = copy.deepcopy(e)
             static_node  = e.find("static")
             dynamic_node = e.find("dynamic/filter")
+
+            # Fix error 3: dynamic_node.text is str | None — default to ""
+            dynamic_filter = dynamic_node.text if dynamic_node is not None and dynamic_node.text is not None else ""
+
             groups.append(AddressGroup(
                 name        = e.attrib["name"],
                 type        = "static" if static_node is not None else "dynamic",
                 members     = self._members(static_node),
-                filter      = dynamic_node.text if dynamic_node is not None else "",
+                filter      = dynamic_filter,
                 description = self._text(e, "description"),
                 tags        = self._tags(e),
             ))
@@ -281,6 +300,7 @@ class PanoramaClient:
         root     = self._query(self._dg_xpath(dg_name, "/service"))
         services = []
         for e in root.findall(".//service/entry"):
+            e                        = copy.deepcopy(e)
             proto, src_port, dst_port = "unknown", "", ""
             for p in ("tcp", "udp", "sctp"):
                 proto_node = e.find(f"protocol/{p}")
@@ -323,19 +343,17 @@ class PanoramaClient:
 
     # ── Policy Parsers ───────────────────────────────────────────────────────
 
-    def _parse_security_rules(self, root: ET.Element) -> list[SecurityRule]:
+    def _parse_security_rules(self, root: ET.Element, dg_name: str) -> list[SecurityRule]:
         rules = []
         for e in root.findall(".//rules/entry"):
-            # Fix 3: deep-copy each rule element so rules with identical names
-            # across device groups are fully independent objects in memory
             e = copy.deepcopy(e)
 
-            profile_setting = {}
+            profile_setting: dict[str, str] = {}
             ps = e.find("profile-setting")
             if ps is not None:
                 group_node = ps.find("group/member")
                 if group_node is not None:
-                    profile_setting = {"type": "group", "name": group_node.text}
+                    profile_setting = {"type": "group", "name": group_node.text or ""}
                 else:
                     profile_setting = {
                         "type":    "profiles",
@@ -345,11 +363,14 @@ class PanoramaClient:
                         "spyware": self._text(ps, "profiles/spyware/member"),
                     }
 
-            log_start = self._text(e, "log-start", default="no")  == "yes"
-            log_end   = self._text(e, "log-end",   default="yes") == "yes"
+            log_start     = self._text(e, "log-start", default="no")  == "yes"
+            log_end       = self._text(e, "log-end",   default="yes") == "yes"
+            original_name = e.attrib["name"]
 
             rules.append(SecurityRule(
-                name                  = e.attrib["name"],
+                name                  = f"{dg_name}::{original_name}",
+                rule_name             = original_name,
+                device_group          = dg_name,
                 rule_type             = self._text(e, "rule-type", "universal"),
                 description           = self._text(e, "description"),
                 tags                  = self._tags(e),
@@ -368,34 +389,48 @@ class PanoramaClient:
             ))
         return rules
 
-    def _parse_nat_rules(self, root: ET.Element) -> list[NatRule]:
+    def _parse_nat_rules(self, root: ET.Element, dg_name: str) -> list[NatRule]:
         rules = []
         for e in root.findall(".//rules/entry"):
-            # Fix 3: same deep-copy protection applied to NAT rules
             e = copy.deepcopy(e)
 
-            src_xlat, dst_xlat = {}, {}
+            src_xlat: dict[str, Union[str, list[str]]] = {}
+            dst_xlat: dict[str, str]                   = {}
+
             src_node = e.find("source-translation")
             if src_node is not None:
                 for stype in ("dynamic-ip-and-port", "dynamic-ip", "static-ip"):
                     st = src_node.find(stype)
                     if st is not None:
                         src_xlat = {"type": stype}
+
                         addr = st.find("translated-address")
                         if addr is not None:
-                            src_xlat["translated-address"] = self._members(addr) or addr.text
+                            members = self._members(addr)
+                            # Fix error 4: guarantee str, never None, when falling
+                            # back to element text for single static IP entries
+                            src_xlat["translated-address"] = members if members else (addr.text or "")
+
                         iface = st.find("interface-address/interface")
                         if iface is not None:
-                            src_xlat["interface"] = iface.text
+                            # Fix error 5: iface.text is str | None — default to ""
+                            src_xlat["interface"] = iface.text or ""
+
                         break
+
             dst_node = e.find("destination-translation")
             if dst_node is not None:
                 dst_xlat = {
                     "translated-address": self._text(dst_node, "translated-address"),
                     "translated-port":    self._text(dst_node, "translated-port"),
                 }
+
+            original_name = e.attrib["name"]
+
             rules.append(NatRule(
-                name                    = e.attrib["name"],
+                name                    = f"{dg_name}::{original_name}",
+                rule_name               = original_name,
+                device_group            = dg_name,
                 description             = self._text(e, "description"),
                 tags                    = self._tags(e),
                 source_zones            = self._members(e.find("from")),
@@ -412,15 +447,15 @@ class PanoramaClient:
 
     def get_security_rules(self, dg_name: str, position: str = "pre") -> list[SecurityRule]:
         root = self._query(self._dg_xpath(dg_name, f"/{position}-rulebase/security"))
-        return self._parse_security_rules(root)
+        return self._parse_security_rules(root, dg_name)
 
     def get_nat_rules(self, dg_name: str, position: str = "pre") -> list[NatRule]:
         root = self._query(self._dg_xpath(dg_name, f"/{position}-rulebase/nat"))
-        return self._parse_nat_rules(root)
+        return self._parse_nat_rules(root, dg_name)
 
     # ── Full Device Group Extraction ─────────────────────────────────────────
 
-    def fetch_device_group(self, dg_name: str, parent: Optional[str], device_info: dict) -> DeviceGroupData:
+    def fetch_device_group(self, dg_name: str, parent: Optional[str], device_info: dict[str, dict[str, str]]) -> DeviceGroupData:
         dg = DeviceGroupData(name=dg_name, parent=parent)
 
         steps = [
@@ -492,8 +527,6 @@ def print_summary(device_groups: list[DeviceGroupData]) -> None:
 
 
 def export_to_json(device_groups: list[DeviceGroupData], output_file: str = "panorama_full_export.json") -> None:
-    # Fix 2: deep-copy before asdict() prevents dataclasses.asdict() from
-    # memoizing and deduplicating shared object references across device groups
     with open(output_file, "w") as f:
         json.dump([asdict(copy.deepcopy(dg)) for dg in device_groups], f, indent=2)
     print(f"\n✅ Full export saved to: {output_file}")
